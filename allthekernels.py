@@ -6,8 +6,6 @@ Like magic!
 import os
 import sys
 import asyncio
-import logging
-
 from tornado.ioloop import IOLoop
 
 import zmq
@@ -69,23 +67,21 @@ class KernelProxy(object):
         self.iosub.connect(self.manager._make_url('iopub'))
         IOLoop.current().add_callback(self.relay_shell)
         IOLoop.current().add_callback(self.relay_iopub)
-        self.shell_reply_event = asyncio.Event()
+        self.shell_reply_event = asyncio.Event() # to track if on shell channel the reply message has been received on shell
 
 
     async def relay_shell(self):
         """Coroutine for relaying any shell replies"""
         while True:
             msg = await self.shell.recv_multipart()
+            self.shell_reply_event.set() # the status of shell_reply_event is changed to set when the reply is received
             self.shell_upstream.send_multipart(msg)
-            self.shell_reply_event.set()
 
 
     async def relay_iopub(self):
         """Coroutine for relaying IOPub messages from all of our kernels"""
         while True:
             msg = await self.iosub.recv_multipart()
-            #logging.warning('************IOPUB MESSAGE IS*************', msg)
-            #deserialize filter sur le status
             self.iopub_upstream.send_multipart(msg)
 
 
@@ -108,7 +104,6 @@ class AllTheKernels(Kernel):
         self.future_context = Context()
         self.shell_stream = self.shell_streams[0]
 
-
     def start_kernel(self, name):
         """Start a new kernel"""
         base, ext = os.path.splitext(self.parent.connection_file)
@@ -124,7 +119,7 @@ class AllTheKernels(Kernel):
             connection_file=cf,
         )
         manager.start_kernel()
-        self.kernels[name]  = KernelProxy(
+        self.kernels[name] = kernel = KernelProxy(
             manager=manager,
             shell_upstream=self.shell_stream,
             iopub_upstream =self.iopub_socket,
@@ -170,15 +165,31 @@ class AllTheKernels(Kernel):
 
         Status messages will be relayed from the actual kernels.
         """
-
         if self._atk_parent and self._atk_parent['header']['msg_type'] in {
             'execute_request', 'inspect_request', 'complete_request'
         }:
-            #self.log.debug("suppressing %s status message.", status)
-            #self.log.debug("current status is %s", status)
+            self.log.debug("suppressing %s status message.", status)
             return
         else:
             return super()._publish_status(status, channel, parent)
+
+    async def execute_request(self, stream, ident, parent):
+        """Execute request sent to a kernel
+
+        Gets the `>kernel` line off of the cell,
+        finds the kernel (starts it if necessary),
+        then relays the request.
+        """
+        content = parent['content']
+        cell = content['code']
+        kernel_name, cell = self.split_cell(cell)
+        content['code'] = cell
+        kernel = self.get_kernel(kernel_name)
+        self.log.debug("Relaying %s to %s", parent['header']['msg_type'], kernel_name)
+        self.session.send(kernel.shell, parent, ident=ident)
+        await kernel.shell_reply_event.wait() # waiting till shell_reply event status is 'set'
+        kernel.shell_reply_event.clear() # then the event's status is changed to 'unset'
+
 
 
     async def relay_to_kernel(self, stream, ident, parent):
@@ -192,40 +203,13 @@ class AllTheKernels(Kernel):
         cell = content['code']
         kernel_name, cell = self.split_cell(cell)
         content['code'] = cell
-        kernel_proxy = self.get_kernel(kernel_name)
+        kernel = self.get_kernel(kernel_name)
         self.log.debug("Relaying %s to %s", parent['header']['msg_type'], kernel_name)
-        self.session.send(kernel_proxy.shell, parent, ident=ident)
-
-
-
-    async def execute_request(self, stream, ident, parent):
-        """Relay an execute_request message to a kernel
-
-        Gets the `>kernel` line off of the cell,
-        finds the kernel (starts it if necessary),
-        then relays the request.
-        """
-        logging.warning('*************ENTERING THE EXECUTE_REQUEST METHOD*****************')
-        content = parent['content']
-        cell = content['code']
-        kernel_name, cell = self.split_cell(cell)
-        content['code'] = cell
-        logging.warning('*************STARTING KERNEL %s*****************',kernel_name)
-        kernel_client = self.get_kernel(kernel_name)
-        self.log.debug("Relaying %s to %s", parent['header']['msg_type'], kernel_name)
-        logging.warning('*************SESSION SEND MESSAGE TO KERNEL SHELL*****************')
-        self.session.send(kernel_client.shell, parent, ident=ident)
-        logging.warning('************EVENT JUST AFTER SELF.SESSION.SEND*****************', kernel_client.shell_reply_event)
-        await kernel_client.shell_reply_event.wait()
-        logging.warning('************EVENT JUST AFTER AWAIT THE SHELL_REPLY_EVENT*****************', kernel_client.shell_reply_event)
-        kernel_client.shell_reply_event.clear()
-        logging.warning('************EVENT JUST AFTER UNSET THE EVENT*****************', kernel_client.shell_reply_event)
-        logging.warning('*************EXITING THE EXECUTE_REQUEST METHOD*****************')
+        self.session.send(kernel.shell, parent, ident=ident)
 
 
     inspect_request = relay_to_kernel
     complete_request = relay_to_kernel
-
 
     def do_shutdown(self, restart):
         for kernel in self.kernels.values():
@@ -248,4 +232,3 @@ main = AllTheKernelsApp.launch_instance
 
 if __name__ == '__main__':
     main()
-
